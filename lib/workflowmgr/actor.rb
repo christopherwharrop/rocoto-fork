@@ -66,6 +66,12 @@ module WorkflowMgr
 
     RUNNER = File.expand_path("../../sbin/rocotoactor", __dir__)
 
+    # Object methods a served class may define without it being a mistake.
+    # The handle answers these itself rather than forwarding them, which is
+    # harmless for these but would silently swallow a call to anything else
+    # Object defines -- send and method especially.
+    TOLERATED_OVERRIDES = %i[to_s inspect == <=> hash eql?].freeze
+
     class ActorError < StandardError; end
     class ActorTimeout < ActorError; end
     class ActorUnavailable < ActorError; end
@@ -321,10 +327,12 @@ module WorkflowMgr
 
       exited = @abandoned.nil? && @pending.nil? && request_stop && reap(patient: true)
       @abandoned = :stopped
-      # Whatever patient waiting was worth doing already happened above;
-      # doing it again would just add another second to a shutdown that has
-      # plainly gone wrong.
-      terminate! unless exited
+      # Patient on purpose. Short-circuiting above means the polite request,
+      # and the patient wait with it, is skipped entirely whenever a reply is
+      # outstanding or the actor was already abandoned -- which is precisely
+      # the "give up on a hung actor" case. Killing without then waiting for
+      # the corpse would leave a zombie for as long as this process lives.
+      terminate!(patient: true) unless exited
       self.class.remove_socket(@socket_path)
     end
 
@@ -338,16 +346,18 @@ module WorkflowMgr
     # itself. A served class defining any of those would have those calls
     # quietly answered by the handle instead, so refuse to spawn at all.
     #
-    # Methods inherited from Object are deliberately not included. The
-    # handle answers to_s, inspect, == and friends itself and never
-    # forwards them, but classes define those for their own reasons -- a
-    # to_s for logging, or Comparable's == -- and none of that is a reason
-    # to refuse to serve the class.
+    # Most of Object's methods count too, since the handle answers those
+    # itself as well. The exceptions are in TOLERATED_OVERRIDES: a class may
+    # define to_s for its own logging, or get == and friends from Comparable,
+    # Struct or Data, and none of that is a reason to refuse to serve it.
     #
     ##########################################
     def reject_shadowed_methods!(klass)
       defined_here = (klass.ancestors - Object.ancestors).flat_map { |mod| mod.instance_methods(false) }.uniq
-      shadowed = defined_here & (Actor.public_instance_methods(false) + [STOP_MESSAGE.to_sym])
+      answered_here = (self.class.ancestors - Object.ancestors)
+                      .flat_map { |mod| mod.public_instance_methods(false) }
+      shadowed = defined_here & (answered_here + (Object.instance_methods - TOLERATED_OVERRIDES) +
+                                 [STOP_MESSAGE.to_sym])
       return if shadowed.empty?
 
       raise ArgumentError, "#{klass} defines #{shadowed.sort.join(', ')}, which an Actor handle answers itself; " \

@@ -44,6 +44,16 @@ RSpec.describe WorkflowMgr::Actor do
     nil
   end
 
+  # Waits for a process to disappear entirely, rather than merely stop
+  # running. Deliberately never reaps: a handle that kills without
+  # collecting leaves a zombie behind, and a helper that collected it first
+  # would hide that for good.
+  def wait_until_collected(pid, within:)
+    deadline = Time.now + within
+    sleep 0.05 while process_state(pid) && Time.now < deadline
+    process_state(pid).nil?
+  end
+
   def wait_until_dead(pid, within:)
     deadline = Time.now + within
     sleep 0.1 while alive?(pid) && Time.now < deadline
@@ -113,9 +123,10 @@ RSpec.describe WorkflowMgr::Actor do
 
     actor.stop!
 
-    # Killing is not instantaneous -- the kernel still has to schedule the
-    # doomed process -- and stop! deliberately does not wait around for it.
-    expect(wait_until_dead(pid, within: 5)).to be true
+    # Collected, not merely dead: a process left as a zombie is a leak that
+    # lasts as long as this one lives. Asserted with a helper that does not
+    # reap, since reaping is exactly what would paper over such a leak.
+    expect(wait_until_collected(pid, within: 5)).to be true
     expect(File.exist?(socket_dir)).to be false
   end
 
