@@ -133,12 +133,27 @@ module WorkflowMgr
 
   ##########################################
   #
+  # WorkflowMgr.message_sink
+  #
+  # When set, messages are handed to this instead of being written out. An
+  # actor installs one: its stderr goes to /dev/null and it knows neither
+  # the workflow id nor how verbose the user asked things to be, so whatever
+  # it has to say must travel back to the process that does know.
+  #
+  ##########################################
+  class << self
+    attr_accessor :message_sink
+  end
+
+  ##########################################
+  #
   # WorkflowMgr.stderr
   #
   ##########################################
   def self.stderr(message, level = 0)
     return if message.nil?
     return if message.empty?
+    return message_sink.call(:stderr, message, level) if message_sink
 
     verbose = defined?(WorkflowMgr::VERBOSE) ? WorkflowMgr::VERBOSE : 0
     workflow_id = defined?(WorkflowMgr::WORKFLOW_ID) ? WorkflowMgr::WORKFLOW_ID : 'unknown'
@@ -156,6 +171,7 @@ module WorkflowMgr
   def self.log(message)
     return if message.nil?
     return if message.empty?
+    return message_sink.call(:log, message, nil) if message_sink
 
     # Get workflow ID, or use 'unknown' if not defined
     workflow_id = defined?(WorkflowMgr::WORKFLOW_ID) ? WorkflowMgr::WORKFLOW_ID : 'unknown'

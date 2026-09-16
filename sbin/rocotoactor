@@ -71,9 +71,18 @@ end
 report_startup_failure = lambda do |error|
   conn = server.accept
   drain_request.call(conn, 30)
-  conn.puts(JSON.generate({ "error" => { "class" => error.class.name,
-                                         "message" => "could not be started: #{error.message}" },
-                            "fatal" => true }))
+  answer = { "error" => { "class" => error.class.name,
+                          "message" => "could not be started: #{error.message}" },
+             "fatal" => true }
+
+  # Whatever it managed to say before giving up usually explains why. Only
+  # available if we got far enough to load the actor code at all.
+  if defined?(WorkflowMgr::Actor)
+    said = WorkflowMgr::Actor.drain_messages
+    answer["messages"] = said unless said.empty?
+  end
+
+  conn.puts(JSON.generate(answer))
   conn.close
 rescue StandardError
   nil
@@ -92,6 +101,12 @@ begin
   $LOAD_PATH.unshift("#{rocoto_dir}/lib")
   require "workflowmgr/utilities"
   require "workflowmgr/actor"
+
+  # Installed before the served object exists, so that anything it says
+  # while being built travels back with the first reply rather than going to
+  # the /dev/null this process writes to.
+  WorkflowMgr::Actor.capture_messages!
+
   require source_file unless source_file.nil? || source_file.empty?
 
   args = WorkflowMgr::Actor::Codec.decode(JSON.parse(args_json))

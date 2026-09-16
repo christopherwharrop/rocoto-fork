@@ -35,6 +35,7 @@ module WorkflowMgr
     require 'timeout'
     require 'tmpdir'
     require 'workflowmgr/actor/codec'
+    require 'workflowmgr/utilities'
 
     # Reserved, protocol-level message that stops the actor process itself
     # rather than being forwarded to the real served object.
@@ -65,6 +66,11 @@ module WorkflowMgr
     # is what load_jobs on a large workflow would be.
     READ_CHUNK = 65_536
     WRITE_CHUNK = 65_536
+
+    # How much one reply will carry back from the actor. Both a count and a
+    # size, since a thousand backtraces is still an unbounded reply.
+    MESSAGE_LIMIT = 1000
+    MESSAGE_BYTES = 262_144
 
     # Sockets live in node-local /tmp rather than under $HOME: home
     # directories on HPC systems are usually on shared filesystems (a hang
@@ -159,7 +165,90 @@ module WorkflowMgr
         Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
+      ##########################################
+      #
+      # capture_messages!
+      #
+      # Collects whatever the served object says instead of writing it out,
+      # so it can ride back with the reply. Called by the runner before the
+      # served object is built, so that even what it says while starting up
+      # reaches the caller.
+      #
+      ##########################################
+      def capture_messages!
+        # Deliberately not a reset: called twice, this must not swallow
+        # whatever was said in between.
+        @messages ||= []
+        @dropped ||= 0
+        @message_bytes ||= 0
+        WorkflowMgr.message_sink = lambda do |kind, message, level|
+          record_message(kind, message, level)
+          nil
+        end
+      end
+
+      def stop_capturing!
+        WorkflowMgr.message_sink = nil
+      end
+
+      ##########################################
+      #
+      # drain_messages
+      #
+      # Public because the runner reports a failure to start by hand, and
+      # what the object said before failing is usually the explanation.
+      #
+      ##########################################
+      def drain_messages
+        messages = pending_messages
+        clear_messages
+        messages
+      end
+
       private
+
+      def record_message(kind, message, level)
+        text = printable(message)
+        if @messages.size >= MESSAGE_LIMIT || @message_bytes + text.bytesize > MESSAGE_BYTES
+          @dropped += 1
+          return
+        end
+
+        @message_bytes += text.bytesize
+        @messages << [kind.to_s, text, level.to_i]
+      end
+
+      # What a served object logs is often raw output from a scheduler
+      # command, which is not necessarily valid UTF-8 and which JSON cannot
+      # write. Scrubbing it here keeps one bad log line from destroying the
+      # reply it was attached to, and copies the string, so later changes to
+      # the caller's own do not follow it across.
+      def printable(message)
+        message.to_s.dup.force_encoding(Encoding::BINARY)
+               .encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+      end
+
+      # Says so rather than quietly truncating: a half-told explanation that
+      # looks whole is worse than one that admits what is missing.
+      def pending_messages
+        messages = @messages || []
+        return messages if (@dropped || 0).zero?
+
+        messages + [["stderr", "#{@dropped} further message(s) from this actor were dropped", 0]]
+      end
+
+      def clear_messages
+        @messages = []
+        @dropped = 0
+        @message_bytes = 0
+      end
+
+      def with_messages(response)
+        messages = pending_messages
+        return response if messages.empty?
+
+        response.merge("messages" => messages)
+      end
 
       def dispatch_one(conn, real_object, allowed)
         progress = { started: false }
@@ -167,14 +256,17 @@ module WorkflowMgr
         name = request["method"]
 
         if name == STOP_MESSAGE
-          reply(conn, { "result" => true }, progress)
+          clear_messages if reply(conn, with_messages({ "result" => true }), progress)
           return false
         end
 
-        reply(conn, build_response(real_object, allowed, name, Codec.decode(request["args"] || [])), progress)
+        response = build_response(real_object, allowed, name, Codec.decode(request["args"] || []))
+        # Only forgotten once they are actually on their way: a reply that
+        # failed to go out should leave them for the next one to carry.
+        clear_messages if reply(conn, with_messages(response), progress)
         true
       rescue StandardError => e
-        reply(conn, error_response(e), progress) unless progress[:started]
+        clear_messages if !progress[:started] && reply(conn, with_messages(error_response(e)), progress)
         true
       # Anything that isn't a StandardError -- a failed require, runaway
       # recursion, the served code calling exit -- means this process can't
@@ -183,7 +275,7 @@ module WorkflowMgr
       # reply is already on the wire: a second one would be appended to the
       # first, and the caller would parse the two together as nonsense.
       rescue Exception => e # rubocop:disable Lint/RescueException
-        reply(conn, fatal_response(e), progress) unless progress[:started]
+        reply(conn, with_messages(fatal_response(e)), progress) unless progress[:started]
         raise
       ensure
         conn.close
@@ -228,14 +320,23 @@ module WorkflowMgr
       #
       ##########################################
       def reply(conn, response, progress = { started: false })
-        payload = begin
-          "#{JSON.generate(response)}\n"
-        rescue StandardError => e
-          "#{JSON.generate(error_response(e, 'reply could not be encoded: '))}\n"
-        end
-        write_reply(conn, payload, progress)
+        write_reply(conn, "#{encode_reply(response)}\n", progress)
       rescue StandardError
-        nil
+        false
+      end
+
+      # If the reply cannot be written as JSON, the messages riding along
+      # with it are the likeliest culprit, and the result itself may be
+      # perfectly good -- so drop them and try again rather than throwing
+      # away the answer too.
+      def encode_reply(response)
+        JSON.generate(response)
+      rescue StandardError => e
+        begin
+          JSON.generate(response.reject { |key, _value| key == "messages" })
+        rescue StandardError
+          JSON.generate(error_response(e, "reply could not be encoded: "))
+        end
       end
 
       # progress records whether any of this reply reached the wire, so that
@@ -256,6 +357,8 @@ module WorkflowMgr
           progress[:started] = true
           sent += written
         end
+
+        sent == out.bytesize
       end
 
       # Dir.mktmpdir creates a brand new directory, mode 0700, with an
@@ -515,6 +618,8 @@ module WorkflowMgr
     end
 
     def handle_response(response)
+      emit_messages(response["messages"])
+
       if response.key?("error")
         # The actor is on its way out, so there is nothing left to talk to.
         abandon!("exited after the served code raised #{response['error']['class']}") if response["fatal"]
@@ -522,6 +627,22 @@ module WorkflowMgr
       end
 
       Codec.decode(response["result"])
+    end
+
+    # Written out here rather than in the actor, since this is the process
+    # with a terminal, a workflow id, and the verbosity the user asked for.
+    # Emitted before the result is returned or the error raised, so they read
+    # in the order they happened.
+    def emit_messages(messages)
+      return if messages.nil?
+
+      messages.each do |kind, message, level|
+        if kind == "log"
+          WorkflowMgr.log(message)
+        else
+          WorkflowMgr.stderr(message, level || 0)
+        end
+      end
     end
 
     def raise_remote_error(error)
