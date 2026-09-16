@@ -1,4 +1,4 @@
-!/usr/bin/env ruby
+#!/usr/bin/env ruby
 
 # Generic bootstrap for any WorkflowMgr::Actor. Given a class name, JSON
 # constructor args, and an inherited listening socket file descriptor, this
