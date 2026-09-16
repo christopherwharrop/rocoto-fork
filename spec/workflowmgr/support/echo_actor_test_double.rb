@@ -11,6 +11,14 @@ class EchoActorTestDouble
     "hello #{@name}#{suffix}"
   end
 
+  # Defined for this class's own sake, the way any class might define it for
+  # logging. A handle answers to_s itself and never forwards it, but that is
+  # no reason to refuse to serve the class -- if spawning this ever starts
+  # failing, the shadowed-name check has been made too broad again.
+  def to_s
+    "echo actor for #{@name}"
+  end
+
   def boom
     raise ArgumentError, "kaboom"
   end

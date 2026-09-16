@@ -113,7 +113,9 @@ RSpec.describe WorkflowMgr::Actor do
 
     actor.stop!
 
-    expect(alive?(pid)).to be false
+    # Killing is not instantaneous -- the kernel still has to schedule the
+    # doomed process -- and stop! deliberately does not wait around for it.
+    expect(wait_until_dead(pid, within: 5)).to be true
     expect(File.exist?(socket_dir)).to be false
   end
 
@@ -199,7 +201,7 @@ RSpec.describe WorkflowMgr::Actor do
     # SIGKILL works even on a stopped process, so giving up gets rid of the
     # frozen actor and its socket, without ever having waited on it.
     actor.stop!
-    expect(alive?(pid)).to be false
+    expect(wait_until_dead(pid, within: 5)).to be true
     expect(File.exist?(socket_dir)).to be false
   ensure
     other_actor&.stop!
@@ -310,7 +312,7 @@ RSpec.describe WorkflowMgr::Actor do
     # Bounded by the short stop timeout, not by the call timeout, even
     # though no call was ever made and there is nothing there to answer.
     expect(Time.now - started_at).to be < 8
-    expect(alive?(pid)).to be false
+    expect(wait_until_dead(pid, within: 5)).to be true
   end
 
   it 'answers with an error when a result cannot be encoded, rather than falling silent' do

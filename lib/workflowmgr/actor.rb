@@ -147,25 +147,28 @@ module WorkflowMgr
       private
 
       def dispatch_one(conn, real_object, allowed)
+        progress = { started: false }
         request = Timeout.timeout(READ_TIMEOUT, RequestIncomplete) { JSON.parse(conn.gets.to_s) }
         name = request["method"]
 
         if name == STOP_MESSAGE
-          reply(conn, { "result" => true })
+          reply(conn, { "result" => true }, progress)
           return false
         end
 
-        reply(conn, build_response(real_object, allowed, name, request["args"] || []))
+        reply(conn, build_response(real_object, allowed, name, request["args"] || []), progress)
         true
       rescue StandardError => e
-        reply(conn, error_response(e))
+        reply(conn, error_response(e), progress) unless progress[:started]
         true
       # Anything that isn't a StandardError -- a failed require, runaway
       # recursion, the served code calling exit -- means this process can't
       # be trusted to keep serving. The caller still gets told what happened
-      # before the exception is allowed to end us.
+      # before the exception is allowed to end us, unless part of another
+      # reply is already on the wire: a second one would be appended to the
+      # first, and the caller would parse the two together as nonsense.
       rescue Exception => e # rubocop:disable Lint/RescueException
-        reply(conn, fatal_response(e))
+        reply(conn, fatal_response(e), progress) unless progress[:started]
         raise
       ensure
         conn.close
@@ -209,18 +212,21 @@ module WorkflowMgr
       # killed for what is really just an encoding problem.
       #
       ##########################################
-      def reply(conn, response)
+      def reply(conn, response, progress = { started: false })
         payload = begin
           "#{JSON.generate(response)}\n"
         rescue StandardError => e
           "#{JSON.generate(error_response(e, 'reply could not be encoded: '))}\n"
         end
-        write_reply(conn, payload)
+        write_reply(conn, payload, progress)
       rescue StandardError
         nil
       end
 
-      def write_reply(conn, payload)
+      # progress records whether any of this reply reached the wire, so that
+      # a later failure can tell "nothing was sent, a reply is still owed"
+      # apart from "half a reply is already out there".
+      def write_reply(conn, payload, progress)
         out = payload.dup.force_encoding(Encoding::BINARY)
         deadline = monotonic + REPLY_TIMEOUT
         until out.empty?
@@ -229,7 +235,10 @@ module WorkflowMgr
           break unless IO.select(nil, [conn], nil, remaining)
 
           written = conn.write_nonblock(out, exception: false)
-          out.slice!(0, written) unless written == :wait_writable
+          next if written == :wait_writable
+
+          progress[:started] = true
+          out.slice!(0, written)
         end
       end
 
@@ -312,7 +321,10 @@ module WorkflowMgr
 
       exited = @abandoned.nil? && @pending.nil? && request_stop && reap(patient: true)
       @abandoned = :stopped
-      terminate!(patient: true) unless exited
+      # Whatever patient waiting was worth doing already happened above;
+      # doing it again would just add another second to a shutdown that has
+      # plainly gone wrong.
+      terminate! unless exited
       self.class.remove_socket(@socket_path)
     end
 
@@ -322,16 +334,20 @@ module WorkflowMgr
     #
     # reject_shadowed_methods!
     #
-    # A handle answers some calls itself -- its own methods, anything
-    # inherited from Object, and the protocol's stop message. If the served
-    # class defines any of those, calls to them would never reach the actor
-    # and would quietly return the wrong thing, so refuse to spawn at all.
+    # A handle answers its own methods, and the protocol's stop message,
+    # itself. A served class defining any of those would have those calls
+    # quietly answered by the handle instead, so refuse to spawn at all.
+    #
+    # Methods inherited from Object are deliberately not included. The
+    # handle answers to_s, inspect, == and friends itself and never
+    # forwards them, but classes define those for their own reasons -- a
+    # to_s for logging, or Comparable's == -- and none of that is a reason
+    # to refuse to serve the class.
     #
     ##########################################
     def reject_shadowed_methods!(klass)
       defined_here = (klass.ancestors - Object.ancestors).flat_map { |mod| mod.instance_methods(false) }.uniq
-      shadowed = defined_here & (Object.instance_methods + self.class.public_instance_methods(false) +
-                                 [STOP_MESSAGE.to_sym])
+      shadowed = defined_here & (Actor.public_instance_methods(false) + [STOP_MESSAGE.to_sym])
       return if shadowed.empty?
 
       raise ArgumentError, "#{klass} defines #{shadowed.sort.join(', ')}, which an Actor handle answers itself; " \
