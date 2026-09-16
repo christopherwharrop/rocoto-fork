@@ -94,7 +94,8 @@ begin
   require "workflowmgr/actor"
   require source_file unless source_file.nil? || source_file.empty?
 
-  real_object = Object.const_get(klass_name).new(*JSON.parse(args_json))
+  args = WorkflowMgr::Actor::Codec.decode(JSON.parse(args_json))
+  real_object = Object.const_get(klass_name).new(*args)
 rescue StandardError, ScriptError, SystemStackError => e
   report_startup_failure.call(e)
   exit!(1)

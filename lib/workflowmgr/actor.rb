@@ -34,6 +34,7 @@ module WorkflowMgr
     require 'socket'
     require 'timeout'
     require 'tmpdir'
+    require 'workflowmgr/actor/codec'
 
     # Reserved, protocol-level message that stops the actor process itself
     # rather than being forwarded to the real served object.
@@ -56,6 +57,14 @@ module WorkflowMgr
     # milliseconds; anything slower is either busy with someone else's work
     # or wedged, and gets killed instead. Shutdown shouldn't wait on either.
     STOP_TIMEOUT = 5
+
+    # How much is moved at a time. Both matter for large messages: reading
+    # in small pieces means searching the accumulated reply for its end far
+    # too often, and writing from the front of a buffer means copying what
+    # is left after every write. Either turns a big reply quadratic, which
+    # is what load_jobs on a large workflow would be.
+    READ_CHUNK = 65_536
+    WRITE_CHUNK = 65_536
 
     # Sockets live in node-local /tmp rather than under $HOME: home
     # directories on HPC systems are usually on shared filesystems (a hang
@@ -162,7 +171,7 @@ module WorkflowMgr
           return false
         end
 
-        reply(conn, build_response(real_object, allowed, name, request["args"] || []), progress)
+        reply(conn, build_response(real_object, allowed, name, Codec.decode(request["args"] || [])), progress)
         true
       rescue StandardError => e
         reply(conn, error_response(e), progress) unless progress[:started]
@@ -185,7 +194,7 @@ module WorkflowMgr
           return { "error" => { "class" => "NoMethodError", "message" => "#{name} is not permitted" } }
         end
 
-        { "result" => real_object.public_send(name, *args) }
+        { "result" => Codec.encode(real_object.public_send(name, *args)) }
       rescue StandardError => e
         error_response(e)
       end
@@ -234,17 +243,18 @@ module WorkflowMgr
       # apart from "half a reply is already out there".
       def write_reply(conn, payload, progress)
         out = payload.dup.force_encoding(Encoding::BINARY)
+        sent = 0
         deadline = monotonic + REPLY_TIMEOUT
-        until out.empty?
+        while sent < out.bytesize
           remaining = deadline - monotonic
           break if remaining <= 0
           break unless IO.select(nil, [conn], nil, remaining)
 
-          written = conn.write_nonblock(out, exception: false)
+          written = conn.write_nonblock(out.byteslice(sent, WRITE_CHUNK), exception: false)
           next if written == :wait_writable
 
           progress[:started] = true
-          out.slice!(0, written)
+          sent += written
         end
       end
 
@@ -384,7 +394,7 @@ module WorkflowMgr
       # between, which keeps this safe even when the caller has other
       # threads running (a plain fork could copy a mutex another thread
       # holds). The listening socket is the only descriptor passed on.
-      @pid = Process.spawn(RbConfig.ruby, RUNNER, @klass.name, source_file.to_s, JSON.generate(@args),
+      @pid = Process.spawn(RbConfig.ruby, RUNNER, @klass.name, source_file.to_s, JSON.generate(Codec.encode(@args)),
                            server.fileno.to_s, Process.pid.to_s, @socket_path, server => server)
     rescue StandardError
       self.class.remove_socket(@socket_path)
@@ -406,6 +416,15 @@ module WorkflowMgr
                          "wait for that reply, or stop! to give up on it"
       end
 
+      # Encoded before connecting: a value the codec refuses is the caller's
+      # own mistake, and there is no sense opening a connection to find out.
+      #
+      # Both buffers are measured in bytes, never characters: the socket
+      # deals in bytes, and slicing a UTF-8 string by character count would
+      # silently discard more of it than was actually sent.
+      request = "#{JSON.generate({ 'method' => name, 'args' => Codec.encode(args) })}\n"
+                .force_encoding(Encoding::BINARY)
+
       begin
         conn = UNIXSocket.new(@socket_path)
       rescue SystemCallError, IOError => e
@@ -413,11 +432,7 @@ module WorkflowMgr
         raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) #{abandoned_reason}"
       end
 
-      # Both buffers are measured in bytes, never characters: the socket
-      # deals in bytes, and slicing a UTF-8 string by character count would
-      # silently discard more of it than was actually sent.
-      request = "#{JSON.generate({ 'method' => name, 'args' => args })}\n".force_encoding(Encoding::BINARY)
-      @pending = { name: name, conn: conn, out: request,
+      @pending = { name: name, conn: conn, out: request, sent: 0, complete: false,
                    buffer: +"".force_encoding(Encoding::BINARY), started_at: self.class.monotonic }
       await(timeout)
     end
@@ -452,27 +467,38 @@ module WorkflowMgr
 
     def send_request(deadline)
       out = @pending[:out]
-      until out.empty?
+      while @pending[:sent] < out.bytesize
         raise ReplyTimeout unless IO.select(nil, [@pending[:conn]], nil, time_left(deadline))
 
-        written = @pending[:conn].write_nonblock(out, exception: false)
-        out.slice!(0, written) unless written == :wait_writable
+        # A bounded piece rather than everything still unsent: writing from
+        # the front of the buffer and slicing off what went would copy the
+        # remainder on every pass.
+        piece = out.byteslice(@pending[:sent], WRITE_CHUNK)
+        written = @pending[:conn].write_nonblock(piece, exception: false)
+        @pending[:sent] += written unless written == :wait_writable
       end
     end
 
     def read_reply(deadline)
       loop do
-        line = @pending[:buffer].slice!(/\A[^\n]*\n/)
-        return JSON.parse(line.force_encoding(Encoding::UTF_8)) if line
+        if @pending[:complete]
+          line = @pending[:buffer].slice!(/\A[^\n]*\n/)
+          return JSON.parse(line.force_encoding(Encoding::UTF_8))
+        end
 
         raise ReplyTimeout unless IO.select([@pending[:conn]], nil, nil, time_left(deadline))
 
         # nil rather than an exception is how end-of-file arrives here: the
         # actor closed the connection, or died, before replying.
-        chunk = @pending[:conn].read_nonblock(4096, exception: false)
+        chunk = @pending[:conn].read_nonblock(READ_CHUNK, exception: false)
         raise EOFError, "connection closed before a reply was received" if chunk.nil?
+        next if chunk == :wait_readable
 
-        @pending[:buffer] << chunk unless chunk == :wait_readable
+        # Only the newly arrived bytes are searched for the end of the
+        # reply. Re-scanning everything received so far, every time, is what
+        # made a large reply cost time in proportion to its size squared.
+        @pending[:complete] = true if chunk.include?("\n")
+        @pending[:buffer] << chunk
       end
     end
 
@@ -495,7 +521,7 @@ module WorkflowMgr
         raise_remote_error(response["error"])
       end
 
-      response["result"]
+      Codec.decode(response["result"])
     end
 
     def raise_remote_error(error)

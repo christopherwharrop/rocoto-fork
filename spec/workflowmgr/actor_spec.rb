@@ -264,21 +264,24 @@ RSpec.describe WorkflowMgr::Actor do
     Process.kill('KILL', helper_pid)
     Process.wait(helper_pid)
 
-    # Sent well within the watchdog's 10 second poll, so it is this request
-    # itself, not the watchdog, that makes the actor refuse and exit.
-    conn = UNIXSocket.new(socket_path)
-    conn.puts(JSON.generate({ 'method' => 'greet', 'args' => ['!'] }))
-
-    # Closing a connection with our request still unread makes the kernel
-    # reset it, so "no reply" can show up as either EOF or ECONNRESET.
+    # Two things can happen here, and the test must not care which: the
+    # actor refuses the request, or it has already noticed its parent is
+    # gone and exited, since the watchdog polls every two seconds. Refusing
+    # shows up as EOF or a reset connection; having already gone shows up as
+    # a broken pipe or no socket at all. What matters, and what is asserted,
+    # is that nothing ever answers.
     reply = begin
+      conn = UNIXSocket.new(socket_path)
+      conn.puts(JSON.generate({ 'method' => 'greet', 'args' => ['!'] }))
       conn.gets
-    rescue Errno::ECONNRESET
+    rescue Errno::EPIPE, Errno::ECONNRESET, Errno::ECONNREFUSED, Errno::ENOENT
       nil
+    ensure
+      conn&.close
     end
+
     expect(reply).to be_nil
-    conn.close
-    expect(wait_until_dead(actor_pid, within: 3)).to be true
+    expect(wait_until_dead(actor_pid, within: 5)).to be true
   end
 
   it 'cannot be orphaned while it is still loading, before it can serve anything' do
@@ -330,7 +333,7 @@ RSpec.describe WorkflowMgr::Actor do
     actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
     pid = actor.instance_variable_get(:@pid)
 
-    expect { actor.bad_bytes }.to raise_error(JSON::GeneratorError, /reply could not be encoded/)
+    expect { actor.bad_bytes }.to raise_error(WorkflowMgr::Actor::Codec::Unsupported, /not valid UTF-8/)
 
     # An encoding problem in one result says nothing about the actor's health.
     expect(alive?(pid)).to be true

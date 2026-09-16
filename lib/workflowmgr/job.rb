@@ -33,6 +33,23 @@ module WorkflowMgr
 
     #####################################################
     #
+    # to_wire / from_wire
+    #
+    # How a Job crosses an actor boundary: its fields in constructor order.
+    # The Time in @cycle is handled by the codec rather than here, so this
+    # stays a plain list of values.
+    #
+    #####################################################
+    def to_wire
+      [@id, @task, @cycle, @cores, @state, @native_state, @exit_status, @tries, @nunknowns, @duration]
+    end
+
+    def self.from_wire(fields)
+      new(*fields)
+    end
+
+    #####################################################
+    #
     # pending_submit?
     #
     #####################################################
