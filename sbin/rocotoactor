@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+!/usr/bin/env ruby
 
 # Generic bootstrap for any WorkflowMgr::Actor. Given a class name, JSON
 # constructor args, and an inherited listening socket file descriptor, this
@@ -14,44 +14,71 @@
 # stdio is needed here, with no additional fork.
 
 rocoto_dir = File.expand_path("..", __dir__)
-require_relative "../bundle/bundler/setup"
-$LOAD_PATH.unshift("#{rocoto_dir}/lib")
 
-require "json"
-require "socket"
-require "workflowmgr/utilities"
-require "workflowmgr/actor"
-
-klass_name, source_file, args_json, fd, parent_pid = ARGV
+klass_name, source_file, args_json, fd, parent_pid, socket_path = ARGV
 parent_pid = parent_pid.to_i
-require source_file unless source_file.nil? || source_file.empty?
-real_class = Object.const_get(klass_name)
-args = JSON.parse(args_json)
 
-Process.setsid
-Dir.chdir("/")
-$stdin.reopen("/dev/null")
-$stdout.reopen("/dev/null", "a")
-$stderr.reopen("/dev/null", "a")
+# Every path that ends this process before WorkflowMgr::Actor.serve takes
+# over has to clean up after itself, since exit! runs no ensure blocks.
+remove_socket = lambda do
+  if socket_path
+    File.delete(socket_path) if File.exist?(socket_path)
+    Dir.rmdir(File.dirname(socket_path))
+  end
+rescue SystemCallError
+  nil
+end
 
-server = UNIXServer.for_fd(fd.to_i)
-socket_path = server.addr[1]
-
-# Backstop: if our parent is gone (including a hard kill that gave it no
-# chance to send stop!), we must not outlive it. exit! bypasses serve's own
-# cleanup, so the socket file needs to be removed here too.
-WorkflowMgr::Actor.watch_parent!(parent_pid) do
-  WorkflowMgr::Actor.remove_socket(socket_path)
+# Installed first, and deliberately built from nothing but core Ruby,
+# because everything below this point can block. The requires read from the
+# rocoto install tree, which on a cluster is typically a shared filesystem;
+# a stall there would otherwise leave us running with no way to notice our
+# parent had died, orphaning us for as long as the node stays up.
+Thread.new do
+  sleep 2 while Process.ppid == parent_pid
+  remove_socket.call
   exit!(0)
 end
 
-# If the served object can't even be constructed, stay up just long enough
-# to hand the reason to the first caller. Otherwise all it would ever see is
-# a connection failure, with no clue as to what actually went wrong.
+require "json"
+require "socket"
+
+server = UNIXServer.for_fd(fd.to_i)
+
+# Hands the reason we never started to the first caller, so it sees the real
+# error rather than an unexplained connection failure. This also uses only
+# core Ruby, since loading rocoto itself is one of the things that can fail.
+# The request is drained first: closing a connection with unread data on it
+# makes the kernel reset it, which would discard our reply along with it.
+report_startup_failure = lambda do |error|
+  conn = server.accept
+  conn.gets if IO.select([conn], nil, nil, 30)
+  conn.puts(JSON.generate({ "error" => { "class" => error.class.name,
+                                         "message" => "could not be started: #{error.message}" },
+                            "fatal" => true }))
+  conn.close
+rescue StandardError
+  nil
+ensure
+  remove_socket.call
+end
+
 begin
-  real_object = real_class.new(*args)
+  Process.setsid
+  Dir.chdir("/")
+  $stdin.reopen("/dev/null")
+  $stdout.reopen("/dev/null", "a")
+  $stderr.reopen("/dev/null", "a")
+
+  require_relative "../bundle/bundler/setup"
+  $LOAD_PATH.unshift("#{rocoto_dir}/lib")
+  require "workflowmgr/utilities"
+  require "workflowmgr/actor"
+  require source_file unless source_file.nil? || source_file.empty?
+
+  real_object = Object.const_get(klass_name).new(*JSON.parse(args_json))
 rescue StandardError, ScriptError, SystemStackError => e
-  WorkflowMgr::Actor.serve_startup_failure(server, e)
+  report_startup_failure.call(e)
   exit!(1)
 end
 

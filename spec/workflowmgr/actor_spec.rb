@@ -6,13 +6,42 @@ require 'socket'
 require 'workflowmgr/actor'
 require_relative 'support/echo_actor_test_double'
 require_relative 'support/failing_actor_test_double'
+require_relative 'support/load_hooks_actor_test_double'
+require_relative 'support/slow_start_actor_test_double'
+
+# Defined here rather than in support/, since spawning it never gets as far
+# as loading it in another process.
+class ReservedNameActorTestDouble
+  def wait(seconds = nil)
+    seconds
+  end
+end
 
 RSpec.describe WorkflowMgr::Actor do
+  # A process that has exited but has not yet been collected still answers
+  # kill(0), so reap it first if it is one of ours, and otherwise ask the
+  # kernel for its state. Anything left in Z has already exited.
   def alive?(pid)
+    reap_if_ours(pid)
+    state = process_state(pid)
+    return state != 'Z' unless state.nil?
+
     Process.kill(0, pid)
     true
   rescue Errno::ESRCH
     false
+  end
+
+  def reap_if_ours(pid)
+    Process.waitpid(pid, Process::WNOHANG)
+  rescue Errno::ECHILD, Errno::ESRCH
+    nil
+  end
+
+  def process_state(pid)
+    File.read("/proc/#{pid}/stat")[/\)\s+(\S)/, 1]
+  rescue SystemCallError
+    nil
   end
 
   def wait_until_dead(pid, within:)
@@ -117,9 +146,12 @@ RSpec.describe WorkflowMgr::Actor do
     actor&.stop!
   end
 
-  it 'reports an actor that dies in the middle of a request as unavailable' do
+  it 'says so when served code exits mid-request, rather than leaving the caller guessing' do
     actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
-    expect { actor.die }.to raise_error(WorkflowMgr::Actor::ActorUnavailable)
+    pid = actor.instance_variable_get(:@pid)
+
+    expect { actor.die }.to raise_error(RuntimeError, /called exit with status 1/)
+    expect(wait_until_dead(pid, within: 3)).to be true
   ensure
     actor&.stop!
   end
@@ -234,5 +266,110 @@ RSpec.describe WorkflowMgr::Actor do
     expect(reply).to be_nil
     conn.close
     expect(wait_until_dead(actor_pid, within: 3)).to be true
+  end
+
+  it 'cannot be orphaned while it is still loading, before it can serve anything' do
+    rd, wr = IO.pipe
+    helper_pid = fork do
+      rd.close
+      ENV['ROCOTO_SPEC_SLOW_LOAD'] = '10'
+      helper_actor = described_class.spawn(LoadHooksActorTestDouble, timeout: 5)
+      wr.puts(helper_actor.instance_variable_get(:@pid))
+      wr.close
+      sleep 30
+    end
+    wr.close
+    actor_pid = rd.gets.to_i
+    rd.close
+
+    Process.kill('KILL', helper_pid)
+    Process.wait(helper_pid)
+
+    # Well before that 10 second load finishes: noticing that it has been
+    # orphaned must not depend on getting as far as the serve loop.
+    expect(wait_until_dead(actor_pid, within: 6)).to be true
+  end
+
+  it 'reports a failure that happened while loading, not only one in the constructor' do
+    ENV['ROCOTO_SPEC_FAIL_LOAD'] = 'exploded while loading'
+    actor = described_class.spawn(LoadHooksActorTestDouble, timeout: 5)
+
+    expect { actor.greet }.to raise_error(RuntimeError, /could not be started: exploded while loading/)
+  ensure
+    ENV.delete('ROCOTO_SPEC_FAIL_LOAD')
+    actor&.stop!
+  end
+
+  it 'gives up quickly on an actor stuck starting up that was never called' do
+    actor = described_class.spawn(SlowStartActorTestDouble, timeout: 150)
+    pid = actor.instance_variable_get(:@pid)
+
+    started_at = Time.now
+    actor.stop!
+
+    # Bounded by the short stop timeout, not by the call timeout, even
+    # though no call was ever made and there is nothing there to answer.
+    expect(Time.now - started_at).to be < 8
+    expect(alive?(pid)).to be false
+  end
+
+  it 'answers with an error when a result cannot be encoded, rather than falling silent' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
+    pid = actor.instance_variable_get(:@pid)
+
+    expect { actor.bad_bytes }.to raise_error(JSON::GeneratorError, /reply could not be encoded/)
+
+    # An encoding problem in one result says nothing about the actor's health.
+    expect(alive?(pid)).to be true
+    expect(actor.greet('!')).to eq('hello world!')
+  ensure
+    actor&.stop!
+  end
+
+  it 'hands back a reply far larger than a socket buffer' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 30)
+    expect(actor.big_payload(4_000_000).bytesize).to eq(4_000_000)
+  ensure
+    actor&.stop!
+  end
+
+  it 'carries a large non-ASCII payload without losing any of it, in either direction' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 30)
+    expected = "café " * 200_000
+
+    # Sockets deal in bytes while Ruby strings deal in characters, and a
+    # payload this size cannot be written in one go, so any confusion
+    # between the two silently eats part of it.
+    expect(actor.big_utf8_payload(200_000)).to eq(expected)
+    expect(actor.byte_count(expected)).to eq(expected.bytesize)
+  ensure
+    actor&.stop!
+  end
+
+  it 'reports an error whose class has no name without losing the message' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
+
+    expect { actor.anonymous_boom }.to raise_error(RuntimeError, 'anonymous boom')
+    expect(actor.greet('!')).to eq('hello world!')
+  ensure
+    actor&.stop!
+  end
+
+  it 'refuses calls carrying a block or keyword arguments, which cannot be sent' do
+    actor = described_class.spawn(EchoActorTestDouble, 'world', timeout: 5)
+
+    expect { actor.greet('!') { :ignored } }.to raise_error(WorkflowMgr::Actor::ActorError, /block/)
+    expect { actor.greet(loud: true) }.to raise_error(WorkflowMgr::Actor::ActorError, /keyword/)
+  ensure
+    actor&.stop!
+  end
+
+  it 'refuses to spawn a class whose methods an Actor handle already defines' do
+    expect { described_class.spawn(ReservedNameActorTestDouble) }
+      .to raise_error(ArgumentError, /defines wait/)
+  end
+
+  it 'can only be created by spawning a process for it' do
+    expect { described_class.new(EchoActorTestDouble, ['world']) }.to raise_error(NoMethodError)
   end
 end

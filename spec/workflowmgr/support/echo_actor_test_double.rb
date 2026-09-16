@@ -26,6 +26,35 @@ class EchoActorTestDouble
     File.read("/nonexistent/rocoto-actor-spec")
   end
 
+  # A result that cannot be encoded as JSON: a String tagged as UTF-8 that
+  # holds bytes which are not. Command output and file contents really do
+  # contain such bytes.
+  def bad_bytes
+    "abc\xC3\x28".dup.force_encoding("UTF-8")
+  end
+
+  # A result far larger than a socket buffer, which can only be handed back
+  # in pieces, as fast as the caller reads it.
+  def big_payload(size)
+    "x" * size
+  end
+
+  # The same, but with non-ASCII characters in it, where one character is
+  # more than one byte and the difference between the two matters.
+  def big_utf8_payload(count)
+    "café " * count
+  end
+
+  # Reports what actually arrived, to check the outbound direction.
+  def byte_count(text)
+    text.bytesize
+  end
+
+  # An exception whose class has no name at all.
+  def anonymous_boom
+    raise Class.new(StandardError), "anonymous boom"
+  end
+
   # A programming error rather than a runtime one: LoadError is not a
   # StandardError, so it stands in for broken code that must not keep
   # serving, but whose cause the caller still needs to be told.
