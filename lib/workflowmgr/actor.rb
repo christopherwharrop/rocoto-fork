@@ -16,15 +16,20 @@ module WorkflowMgr
   # -- including an uninterruptible filesystem hang -- can never block
   # whatever holds this handle past its own timeout.
   #
+  # A timeout means "no reply yet", not "dead". Deciding that a slow actor
+  # is beyond hope is a judgement call that depends on what it was asked to
+  # do -- a scheduler under heavy load can legitimately take minutes -- so
+  # the actor is left running and the caller chooses: wait for the same
+  # reply again, or stop! to give up and kill it. While a reply is
+  # outstanding, calls to anything else fail immediately rather than queue,
+  # so a slow actor still can't hold up the process that's talking to it.
+  #
   ##########################################
   class Actor
     require 'json'
-    require 'securerandom'
-    require 'digest'
-    require 'fileutils'
     require 'socket'
     require 'timeout'
-    require 'workflowmgr/utilities'
+    require 'tmpdir'
 
     # Reserved, protocol-level message that stops the actor process itself
     # rather than being forwarded to the real served object.
@@ -34,10 +39,29 @@ module WorkflowMgr
     # client can never wedge the actor's ability to serve everyone else.
     READ_TIMEOUT = 30
 
+    # Sockets live in node-local /tmp rather than under $HOME: home
+    # directories on HPC systems are usually on shared filesystems (a hang
+    # risk for the calling process), and are often long enough to push the
+    # socket path past the kernel's ~104-108 byte limit.
+    SOCKET_ROOT = "/tmp".freeze
+    SOCKET_DIR_PREFIX = "rocoto-actor-".freeze
+
     RUNNER = File.expand_path("../../sbin/rocotoactor", __dir__)
+
+    # Bugs in the served code, such as a failed require or runaway
+    # recursion. Code that is broken must not keep running, but the caller
+    # still needs the real error rather than a bare "the actor vanished",
+    # so these are reported back first and the actor exits afterwards.
+    FATAL_ERRORS = [ScriptError, SystemStackError].freeze
 
     class ActorTimeout < StandardError; end
     class ActorUnavailable < StandardError; end
+    class ActorBusy < StandardError; end
+
+    # Raised only by our own wait for a reply, so it can never be confused
+    # with a Timeout::Error that the served object raised and sent back.
+    class ReplyTimeout < StandardError; end
+    private_constant :ReplyTimeout
 
     class << self
       ##########################################
@@ -57,19 +81,49 @@ module WorkflowMgr
       #
       # Runs forever, dispatching requests from `server` to `real_object`.
       # Called by the generic runner script (sbin/rocotoactor) after it has
-      # daemonized and constructed the real object. Kept separate from all
-      # of that bootstrapping so it can be exercised directly in tests
-      # without forking a whole process.
+      # detached and constructed the real object.
+      #
+      # A request that arrives after our parent is gone was sent by a rocoto
+      # process that no longer exists (e.g. queued while we were hung), and
+      # acting on it could change state that a newer rocoto process now
+      # owns. So instead of serving it, we stop.
       #
       ##########################################
-      def serve(server, real_object)
+      def serve(server, real_object, parent_pid: nil)
         allowed = real_object.class.instance_methods - Object.instance_methods
         loop do
-          break unless dispatch_one(server.accept, real_object, allowed)
+          conn = server.accept
+          unless parent_pid.nil? || Process.ppid == parent_pid
+            conn.close
+            break
+          end
+          break unless dispatch_one(conn, real_object, allowed)
         end
       ensure
-        path = server.addr[1]
-        File.delete(path) if path && File.exist?(path)
+        remove_socket(server.addr[1])
+      end
+
+      ##########################################
+      #
+      # serve_startup_failure
+      #
+      # Used when the served object could not be constructed at all. Waits
+      # for the first caller and hands it the reason, so it sees the real
+      # error instead of an unexplained connection failure, then returns so
+      # the actor can exit. There is deliberately no time limit on that
+      # wait: an actor is often spawned well before its first call, and the
+      # parent watchdog already bounds how long we can linger.
+      #
+      ##########################################
+      def serve_startup_failure(server, error)
+        conn = server.accept
+        conn.gets # the request itself is moot; nothing was ever constructed to serve it
+        reply(conn, error_response(error, "could not be started: ").merge("fatal" => true))
+        conn.close
+      rescue StandardError
+        nil
+      ensure
+        remove_socket(server.addr[1])
       end
 
       ##########################################
@@ -77,24 +131,39 @@ module WorkflowMgr
       # watch_parent!
       #
       # Runs the given block (default: terminate this process immediately)
-      # the moment parent_pid is no longer alive. This is the backstop that
+      # once parent_pid is no longer our parent. This is the backstop that
       # works even if the parent was killed with SIGKILL and never got a
       # chance to tell us to stop.
+      #
+      # Checking Process.ppid rather than whether parent_pid is alive matters:
+      # we are reparented the instant our parent exits, even while it lingers
+      # as an unreaped zombie, and a reused pid can't fool the check.
       #
       ##########################################
       def watch_parent!(parent_pid, poll_interval: 10, &on_parent_gone)
         on_parent_gone ||= -> { exit!(0) }
         Thread.new do
-          loop do
-            begin
-              Process.kill(0, parent_pid)
-            rescue Errno::ESRCH
-              on_parent_gone.call
-              break
-            end
-            sleep poll_interval
-          end
+          sleep poll_interval while Process.ppid == parent_pid
+          on_parent_gone.call
         end
+      end
+
+      ##########################################
+      #
+      # remove_socket
+      #
+      # Removes a socket file and the private directory created for it. Safe
+      # to call more than once, and from either side of the socket.
+      #
+      ##########################################
+      def remove_socket(path)
+        return if path.nil? || path.empty?
+
+        File.delete(path) if File.exist?(path)
+        dir = File.dirname(path)
+        Dir.rmdir(dir) if File.basename(dir).start_with?(SOCKET_DIR_PREFIX)
+      rescue SystemCallError
+        nil
       end
 
       private
@@ -104,18 +173,19 @@ module WorkflowMgr
         name = request["method"]
 
         if name == STOP_MESSAGE
-          conn.puts(JSON.generate({ "result" => true }))
+          reply(conn, { "result" => true })
           return false
         end
 
-        conn.puts(JSON.generate(build_response(real_object, allowed, name, request["args"] || [])))
+        reply(conn, build_response(real_object, allowed, name, request["args"] || []))
         true
+      rescue *FATAL_ERRORS => e
+        # Report it, then let it end this process: the reply is flushed by
+        # the ensure below before the exception unwinds any further.
+        reply(conn, error_response(e).merge("fatal" => true))
+        raise
       rescue StandardError => e
-        begin
-          conn.puts(JSON.generate({ "error" => { "class" => e.class.name, "message" => e.message } }))
-        rescue StandardError
-          nil
-        end
+        reply(conn, error_response(e))
         true
       ensure
         conn.close
@@ -128,18 +198,26 @@ module WorkflowMgr
 
         { "result" => real_object.public_send(name, *args) }
       rescue StandardError => e
-        { "error" => { "class" => e.class.name, "message" => e.message } }
+        error_response(e)
       end
 
-      def socket_path(klass, args)
-        identity = Digest::SHA256.hexdigest("#{klass.name}:#{args.inspect}")[0, 16]
-        File.join(socket_dir, "#{identity}-#{Process.pid}-#{SecureRandom.hex(4)}.sock")
+      def error_response(error, prefix = "")
+        { "error" => { "class" => error.class.name, "message" => "#{prefix}#{error.message}" } }
       end
 
-      def socket_dir
-        dir = File.join(ENV.fetch("HOME"), ".rocoto", WorkflowMgr.version, "tmp")
-        FileUtils.mkdir_p(dir, mode: 0o700)
-        dir
+      def reply(conn, response)
+        conn.puts(JSON.generate(response))
+      rescue StandardError
+        nil
+      end
+
+      # Dir.mktmpdir creates a brand new directory, mode 0700, with an
+      # unguessable name, and fails rather than reuse an existing one. That
+      # is what makes a shared, world-writable /tmp safe here: nobody else
+      # can have pre-created, or later swap out, anything inside it.
+      def new_socket_path(klass)
+        prefix = "#{SOCKET_DIR_PREFIX}#{klass.name.split('::').last}-"
+        File.join(Dir.mktmpdir(prefix, SOCKET_ROOT), "actor.sock")
       end
     end
 
@@ -153,6 +231,9 @@ module WorkflowMgr
       @args = args
       @timeout = timeout
       @allowed = klass.instance_methods - Object.instance_methods
+      @abandoned = nil
+      @pending = nil
+      @reaped = false
     end
 
     ##########################################
@@ -172,39 +253,39 @@ module WorkflowMgr
 
     ##########################################
     #
+    # wait
+    #
+    # Keeps waiting for a reply that an earlier call gave up on, for up to
+    # another `seconds`. Returns that call's result, or raises ActorTimeout
+    # again, leaving the reply outstanding so it can be waited on once more.
+    #
+    ##########################################
+    def wait(seconds = @timeout)
+      raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) #{abandoned_reason}" if @abandoned
+      raise "Actor #{@klass} (pid #{@pid}) has no call waiting for a reply" if @pending.nil?
+
+      await(seconds)
+    end
+
+    ##########################################
+    #
     # stop!
+    #
+    # Asks the actor to exit, and kills it if it doesn't, or if it is busy
+    # with a reply we already gave up on. Never waits longer than one
+    # call's timeout.
     #
     ##########################################
     def stop!
-      call(STOP_MESSAGE, [], allow_relaunch: false)
-    rescue ActorUnavailable, ActorTimeout
-      nil
-    ensure
-      reap
+      return if @abandoned == :stopped
+
+      exited = @abandoned.nil? && @pending.nil? && request_stop && reap
+      @abandoned = :stopped
+      terminate! unless exited
+      self.class.remove_socket(@socket_path)
     end
 
     private
-
-    ##########################################
-    #
-    # reap
-    #
-    # A successful stop! means the actor is already exiting, not hung, so a
-    # brief bounded retry (unlike anywhere we might be dealing with a wedged
-    # actor) is safe here: it just gives the process a moment to actually
-    # finish unwinding and become reapable before we give up.
-    #
-    ##########################################
-    def reap
-      10.times do
-        _reaped_pid, status = Process.waitpid2(@pid, Process::WNOHANG)
-        return status unless status.nil?
-
-        sleep 0.1
-      end
-    rescue Errno::ECHILD
-      nil
-    end
 
     ##########################################
     #
@@ -212,7 +293,7 @@ module WorkflowMgr
     #
     ##########################################
     def launch!
-      @socket_path = self.class.send(:socket_path, @klass, @args)
+      @socket_path = self.class.send(:new_socket_path, @klass)
       server = UNIXServer.new(@socket_path)
       File.chmod(0o600, @socket_path)
 
@@ -222,30 +303,17 @@ module WorkflowMgr
       # that up ourselves instead of asking the developer for it.
       source_file = Object.const_source_location(@klass.name)&.first
 
-      # Must be captured before forking: inside the fork block (pre-exec),
-      # Process.pid is the *child's* own pid, not the real caller's.
-      parent_pid = Process.pid
-
-      @pid = fork do
-        exec(RbConfig.ruby, RUNNER, @klass.name, source_file.to_s, JSON.generate(@args),
-             server.fileno.to_s, parent_pid.to_s, server => server)
-      end
-      server.close
-    end
-
-    ##########################################
-    #
-    # relaunch!
-    #
-    ##########################################
-    def relaunch!
-      begin
-        Process.waitpid(@pid, Process::WNOHANG)
-      rescue Errno::ECHILD
-        nil
-      end
-      File.delete(@socket_path) if File.exist?(@socket_path)
-      launch!
+      # Process.spawn forks and execs without running any Ruby code in
+      # between, which keeps this safe even when the caller has other
+      # threads running (a plain fork could copy a mutex another thread
+      # holds). The listening socket is the only descriptor passed on.
+      @pid = Process.spawn(RbConfig.ruby, RUNNER, @klass.name, source_file.to_s, JSON.generate(@args),
+                           server.fileno.to_s, Process.pid.to_s, server => server)
+    rescue StandardError
+      self.class.remove_socket(@socket_path)
+      raise
+    ensure
+      server&.close
     end
 
     ##########################################
@@ -253,28 +321,97 @@ module WorkflowMgr
     # call
     #
     ##########################################
-    def call(name, args, allow_relaunch: true)
-      attempts = 0
+    def call(name, args)
+      raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) #{abandoned_reason}" if @abandoned
+
+      if @pending
+        raise ActorBusy, "Actor #{@klass} (pid #{@pid}) is still working on #{@pending[:name]}; " \
+                         "wait for that reply, or stop! to give up on it"
+      end
+
       begin
-        WorkflowMgr.timeout(@timeout) { send_request(name, args) }
-      rescue Timeout::Error
-        raise ActorTimeout, "Actor #{@klass} (pid #{@pid}) did not respond within #{@timeout} seconds"
-      rescue Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ENOENT, EOFError => e
-        if allow_relaunch && attempts.zero?
-          attempts += 1
-          relaunch!
-          retry
-        end
-        raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) is unavailable: #{e.message}"
+        conn = UNIXSocket.new(@socket_path)
+      rescue SystemCallError, IOError => e
+        abandon!("became unavailable: #{e.message}")
+        raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) #{abandoned_reason}"
+      end
+
+      @pending = { name: name, conn: conn, out: "#{JSON.generate({ 'method' => name, 'args' => args })}\n",
+                   buffer: +"", started_at: Time.now }
+      await(@timeout)
+    end
+
+    ##########################################
+    #
+    # await
+    #
+    # Sending and receiving are both bounded by the same deadline, since a
+    # large request to an actor that has stopped reading could otherwise
+    # block on the write instead of the read.
+    #
+    ##########################################
+    def await(seconds)
+      deadline = Time.now + seconds
+      response = begin
+        send_request(deadline)
+        read_reply(deadline)
+      rescue ReplyTimeout
+        raise ActorTimeout, "Actor #{@klass} (pid #{@pid}) has not replied to #{@pending[:name]} after " \
+                            "#{(Time.now - @pending[:started_at]).round} seconds; wait for it, " \
+                            "or stop! to give up on it"
+      rescue SystemCallError, IOError, JSON::ParserError => e
+        abandon!("became unavailable: #{e.message}")
+        raise ActorUnavailable, "Actor #{@klass} (pid #{@pid}) #{abandoned_reason}"
+      end
+
+      finish_request
+      handle_response(response)
+    end
+
+    def send_request(deadline)
+      out = @pending[:out]
+      until out.empty?
+        raise ReplyTimeout unless IO.select(nil, [@pending[:conn]], nil, time_left(deadline))
+
+        written = @pending[:conn].write_nonblock(out, exception: false)
+        out.slice!(0, written) unless written == :wait_writable
       end
     end
 
-    def send_request(name, args)
-      conn = UNIXSocket.new(@socket_path)
-      conn.puts(JSON.generate({ "method" => name, "args" => args }))
-      response = JSON.parse(conn.gets.to_s)
-      conn.close
-      raise_remote_error(response["error"]) if response["error"]
+    def read_reply(deadline)
+      loop do
+        line = @pending[:buffer].slice!(/\A[^\n]*\n/)
+        return JSON.parse(line) if line
+
+        raise ReplyTimeout unless IO.select([@pending[:conn]], nil, nil, time_left(deadline))
+
+        # nil rather than an exception is how end-of-file arrives here: the
+        # actor closed the connection, or died, before replying.
+        chunk = @pending[:conn].read_nonblock(4096, exception: false)
+        raise EOFError, "connection closed before a reply was received" if chunk.nil?
+
+        @pending[:buffer] << chunk unless chunk == :wait_readable
+      end
+    end
+
+    def time_left(deadline)
+      remaining = deadline - Time.now
+      raise ReplyTimeout if remaining <= 0
+
+      remaining
+    end
+
+    def finish_request
+      @pending[:conn].close
+      @pending = nil
+    end
+
+    def handle_response(response)
+      if response.key?("error")
+        # The actor is on its way out, so there is nothing left to talk to.
+        abandon!("exited after the served code raised #{response['error']['class']}") if response["fatal"]
+        raise_remote_error(response["error"])
+      end
 
       response["result"]
     end
@@ -285,8 +422,86 @@ module WorkflowMgr
       rescue NameError
         nil
       end
-      error_class = RuntimeError unless error_class.is_a?(Class) && error_class <= Exception
-      raise error_class, error["message"]
+      error_class = RuntimeError unless reconstructable?(error_class)
+      exception = begin
+        error_class.new(error["message"])
+      rescue StandardError
+        RuntimeError.new("#{error['class']}: #{error['message']}")
+      end
+      raise exception
+    end
+
+    # Anything the actor can legitimately report, which is every error it
+    # serializes, but never an exit or a signal.
+    def reconstructable?(error_class)
+      error_class.is_a?(Class) && error_class <= Exception &&
+        !(error_class <= SystemExit) && !(error_class <= SignalException)
+    end
+
+    def request_stop
+      call(STOP_MESSAGE, [])
+      true
+    rescue ActorUnavailable, ActorTimeout
+      false
+    end
+
+    def abandon!(reason)
+      @abandoned = reason
+      terminate!
+    end
+
+    def abandoned_reason
+      @abandoned == :stopped ? "has been stopped" : @abandoned
+    end
+
+    ##########################################
+    #
+    # terminate!
+    #
+    # SIGKILL can't be caught or ignored. A process in uninterruptible sleep
+    # won't act on it until its current syscall returns, but it then dies
+    # before running any more of its own code. We wait at most a second to
+    # reap it; one still stuck after that is left for init to reap.
+    #
+    ##########################################
+    def terminate!
+      begin
+        @pending[:conn].close if @pending
+      rescue IOError
+        nil
+      end
+      @pending = nil
+
+      begin
+        Process.kill("KILL", @pid) unless @reaped
+      rescue Errno::ESRCH
+        nil
+      end
+      reap
+      self.class.remove_socket(@socket_path)
+    end
+
+    ##########################################
+    #
+    # reap
+    #
+    # Once reaped, @pid may be reused by an unrelated process, so this also
+    # records that we must never signal it again.
+    #
+    ##########################################
+    def reap
+      return true if @reaped
+
+      10.times do
+        unless Process.waitpid(@pid, Process::WNOHANG).nil?
+          @reaped = true
+          return true
+        end
+        sleep 0.1
+      end
+      false
+    rescue Errno::ECHILD
+      @reaped = true
     end
   end
 end

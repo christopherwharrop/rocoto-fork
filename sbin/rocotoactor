@@ -23,6 +23,7 @@ require "workflowmgr/utilities"
 require "workflowmgr/actor"
 
 klass_name, source_file, args_json, fd, parent_pid = ARGV
+parent_pid = parent_pid.to_i
 require source_file unless source_file.nil? || source_file.empty?
 real_class = Object.const_get(klass_name)
 args = JSON.parse(args_json)
@@ -39,10 +40,19 @@ socket_path = server.addr[1]
 # Backstop: if our parent is gone (including a hard kill that gave it no
 # chance to send stop!), we must not outlive it. exit! bypasses serve's own
 # cleanup, so the socket file needs to be removed here too.
-WorkflowMgr::Actor.watch_parent!(parent_pid.to_i) do
-  File.delete(socket_path) if socket_path && File.exist?(socket_path)
+WorkflowMgr::Actor.watch_parent!(parent_pid) do
+  WorkflowMgr::Actor.remove_socket(socket_path)
   exit!(0)
 end
 
-real_object = real_class.new(*args)
-WorkflowMgr::Actor.serve(server, real_object)
+# If the served object can't even be constructed, stay up just long enough
+# to hand the reason to the first caller. Otherwise all it would ever see is
+# a connection failure, with no clue as to what actually went wrong.
+begin
+  real_object = real_class.new(*args)
+rescue StandardError, ScriptError, SystemStackError => e
+  WorkflowMgr::Actor.serve_startup_failure(server, e)
+  exit!(1)
+end
+
+WorkflowMgr::Actor.serve(server, real_object, parent_pid: parent_pid)
