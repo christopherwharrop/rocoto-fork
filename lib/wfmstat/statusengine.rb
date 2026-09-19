@@ -18,7 +18,6 @@ module WFMStat
     require 'workflowmgr/dependency'
     require 'workflowmgr/workflowconfig'
     require 'workflowmgr/launchserver'
-    require 'workflowmgr/dbproxy'
     require 'workflowmgr/workflowioproxy'
 
     ##########################################
@@ -57,7 +56,7 @@ module WFMStat
       @options = options
 
       # Set up an object to serve the workflow database (but do not open the database)
-      @db_server = WorkflowMgr::DBProxy.new(@config, @options)
+      @db_server = WorkflowMgr.workflow_database(@config, @options)
     rescue StandardError => e
       WorkflowMgr.stderr(e.message, 1)
       WorkflowMgr.log(e.message)
@@ -105,7 +104,9 @@ module WFMStat
       Process.exit(1)
     ensure
       # Make sure we release the workflow lock in the database and shutdown the db_server
-      if !@db_server.nil? && @config.DatabaseServer
+      # Matches the condition the database was created under: in dryrun it
+      # is an ordinary object in this process, with nothing to shut down.
+      if !@db_server.nil? && @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
         @db_server.stop!
       end
 
@@ -208,7 +209,9 @@ module WFMStat
       Process.exit(1)
     ensure
       # Make sure we release the workflow lock in the database and shutdown the db_server
-      if !@db_server.nil? && @config.DatabaseServer
+      # Matches the condition the database was created under: in dryrun it
+      # is an ordinary object in this process, with nothing to shut down.
+      if !@db_server.nil? && @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
         @db_server.stop!
       end
 

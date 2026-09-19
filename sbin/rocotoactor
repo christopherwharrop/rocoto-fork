@@ -92,7 +92,11 @@ end
 
 begin
   Process.setsid
-  Dir.chdir("/")
+
+  # Deliberately no chdir("/"), though detaching usually calls for one: an
+  # actor acts on its caller's behalf, and a relative path it is handed has
+  # to mean what it meant to the caller. Rocoto is given database and file
+  # paths on the command line, and they are routinely relative.
   $stdin.reopen("/dev/null")
   $stdout.reopen("/dev/null", "a")
   $stderr.reopen("/dev/null", "a")

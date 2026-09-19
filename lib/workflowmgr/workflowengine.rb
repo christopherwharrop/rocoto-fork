@@ -16,7 +16,7 @@ module WorkflowMgr
     require 'workflowmgr/workflowstate'
     require 'workflowmgr/launchserver'
     require 'workflowmgr/workflowdoc'
-    require 'workflowmgr/dbproxy'
+    require 'workflowmgr/workflowdb'
     require 'workflowmgr/workflowioproxy'
     require 'workflowmgr/cycledef'
     require 'workflowmgr/dependency'
@@ -58,7 +58,7 @@ module WorkflowMgr
       @options = options
 
       # Set up an object to serve the workflow database (but do not open the database)
-      @db_server = DBProxy.new(@config, @options)
+      @db_server = WorkflowMgr.workflow_database(@config, @options)
 
       # Initialize the workflow lock
       @locked = false
@@ -794,6 +794,23 @@ module WorkflowMgr
 
     ##########################################
     #
+    # report_cleanup_error
+    #
+    # Reports something that went wrong while shutting down. Writing a log
+    # entry means touching $HOME, which can itself fail or hang -- and it
+    # runs from inside ensure, where an exception would skip the unlock that
+    # has not happened yet. So even the reporting is allowed to fail.
+    #
+    ##########################################
+    def report_cleanup_error(error)
+      WorkflowMgr.stderr(error.message, 1)
+      WorkflowMgr.log(error.message)
+    rescue StandardError
+      nil
+    end
+
+    ##########################################
+    #
     # with_locked_db
     #
     ##########################################
@@ -801,6 +818,11 @@ module WorkflowMgr
       # This locks the database and passes control to a code block,
       # and then unlocks the database afterwards, even on error.
 
+
+      # Whether the block finished on its own terms. If it did not, whatever
+      # is already unwinding decides how this run ends -- an exception, or a
+      # status the block chose for itself -- and cleanup must not overrule it.
+      completed = false
 
       # Open/Create the database
       @db_server.dbopen
@@ -816,6 +838,7 @@ module WorkflowMgr
       # Pass control to the code block
       #
       yield
+      completed = true
       #
       ######################################
     rescue StandardError => e
@@ -827,26 +850,60 @@ module WorkflowMgr
       end
       Process.exit(1)
     ensure
+      # Nothing in here may abort what follows it. Whatever fails while
+      # shutting down, the workflow still has to be unlocked, and an error
+      # raised on the way out would replace the one that ended the run.
+      unlock_failed = false
+
       # Shut down the batch queue server if it is no longer needed
       # Skip if in dryrun mode since no server was launched
-      if !(@bq_server.nil? || !@config.BatchQueueServer || WorkflowMgr.dryrun_mode?) && !@bq_server.running?
-        uri = @bq_server.__drburi
-        @bq_server.stop!
-        @db_server.delete_bqservers([uri])
+      begin
+        if !(@bq_server.nil? || !@config.BatchQueueServer || WorkflowMgr.dryrun_mode?) && !@bq_server.running?
+          uri = @bq_server.__drburi
+          @bq_server.stop!
+          @db_server.delete_bqservers([uri])
+        end
+      rescue StandardError => e
+        report_cleanup_error(e)
       end
 
       # Make sure we release the workflow lock in the database and shutdown the dbserver
       # Skip server shutdown if in dryrun mode since no server was launched
       unless @db_server.nil?
-        @db_server.unlock_workflow if @locked
-        @db_server.stop! if @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
+        begin
+          # A false return means there was no lock of ours left to release:
+          # someone judged ours stale and took it, so for a while two runs
+          # may have been advancing this one workflow. Like a failure to
+          # unlock, that must not pass for success.
+          released = @db_server.unlock_workflow if @locked
+          unlock_failed = true if @locked && !released
+        rescue StandardError => e
+          # Reported rather than raised -- another error may already be on
+          # its way to the user -- but the run has left the workflow locked
+          # behind it, so it must not go on to claim it succeeded.
+          report_cleanup_error(e)
+          unlock_failed = true
+        end
+        begin
+          @db_server.stop! if @config.DatabaseServer && !WorkflowMgr.dryrun_mode?
+        rescue StandardError => e
+          report_cleanup_error(e)
+        end
       end
 
       # Make sure to shut down the workflow file stat server
       # Skip if in dryrun mode since no server was launched
-      if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
-        @workflow_io_server.stop!
+      begin
+        if !@workflow_io_server.nil? && @config.WorkflowIOServer && !WorkflowMgr.dryrun_mode?
+          @workflow_io_server.stop!
+        end
+      rescue StandardError => e
+        report_cleanup_error(e)
       end
+
+      # Only when the run otherwise succeeded: an exception on its way out,
+      # or an exit status the block chose, already says how this ended.
+      Process.exit(1) if unlock_failed && completed
     end
 
     ##########################################

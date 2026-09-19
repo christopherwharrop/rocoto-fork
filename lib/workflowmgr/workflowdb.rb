@@ -34,6 +34,34 @@ module WorkflowMgr
   # Class WorkflowSQLite3DB
   #
   ##########################################
+  require 'workflowmgr/actor'
+
+  # How long to wait on the database when it runs in its own process. The
+  # same patience the DRb-based proxy allowed before it was replaced.
+  DATABASE_TIMEOUT = 150
+
+  ##########################################
+  #
+  # WorkflowMgr.workflow_database
+  #
+  # The workflow database: in a process of its own when isolation is wanted,
+  # in this one when it is not. Both answer the same calls, so nothing above
+  # this needs to know which it was handed.
+  #
+  # An actor is told this process's pid, because the workflow lock belongs
+  # to rocoto and has to outlive any actor that happens to write it.
+  #
+  ##########################################
+  def self.workflow_database(config, options)
+    database_class = const_get("Workflow#{config.DatabaseType}DB")
+
+    if config.DatabaseServer && !dryrun_mode?
+      Actor.spawn(database_class, options.database, Process.pid, timeout: DATABASE_TIMEOUT)
+    else
+      database_class.new(options.database)
+    end
+  end
+
   class WorkflowSQLite3DB
     require "sqlite3"
     require "socket"
@@ -48,9 +76,14 @@ module WorkflowMgr
     # initialize
     #
     ##########################################
-    def initialize(database_file)
+    def initialize(database_file, owner_pid = Process.pid)
       # Set name of database file
       @database_file = database_file
+
+      # Whose lock this is. Not necessarily the process running this code:
+      # when the database runs as an actor, the workflow belongs to the
+      # rocoto process that spawned it, and outlives the actor itself.
+      @owner_pid = owner_pid
 
       # Calculate the name of the corresponding workflow lock database
       @database_lock_file = if @database_file =~ /^(\S+)(\.[^.]+)$/
@@ -103,7 +136,7 @@ module WorkflowMgr
 
           # If no lock is present, we have acquired the lock.  Write the WFM's pid and host into the lock table
           if lock.empty?
-            db.execute("INSERT INTO lock VALUES (#{Process.pid},'#{Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]}',#{Time.now.to_i});")
+            db.execute("INSERT INTO lock VALUES (#{@owner_pid},'#{Socket.getaddrinfo(Socket.gethostname, nil, nil, Socket::SOCK_STREAM)[0][3]}',#{Time.now.to_i});")
 
           # Otherwise, we didn't get the lock, but we need to check to make sure the lock is not stale
           else
@@ -136,8 +169,8 @@ module WorkflowMgr
             lockhostinfo = Socket.getaddrinfo(lock[0][1], nil)[0]
             if stale
               db.execute("DELETE FROM lock;")
-              db.execute("INSERT INTO lock VALUES (#{Process.pid},'#{localhostinfo[3]}',#{Time.now.to_i});")
-              msg = "WARNING: Rocoto pid #{Process.pid} on host #{localhostinfo[2]} (#{localhostinfo[3]}) " \
+              db.execute("INSERT INTO lock VALUES (#{@owner_pid},'#{localhostinfo[3]}',#{Time.now.to_i});")
+              msg = "WARNING: Rocoto pid #{@owner_pid} on host #{localhostinfo[2]} (#{localhostinfo[3]}) " \
                     "stole stale lock from Rocoto pid #{lock[0][0]} on host " \
                     "#{lockhostinfo[2]} (#{lockhostinfo[3]})."
               WorkflowMgr.stderr(msg, 3)
@@ -184,23 +217,51 @@ module WorkflowMgr
         # Make sure write access is enabled
         verify_write_access
 
+        # Whether there was a lock of ours to give back. Reported rather
+        # than assumed: finding none means someone judged ours stale and
+        # took it, so for a while two runs may have been advancing the same
+        # workflow, and the caller needs to be able to say so.
+        released = false
+
         # Start a transaction so that the database will be locked
         @database_lock.transaction do |db|
           lock = db.execute("SELECT * FROM lock;")
 
-          if Process.pid == lock[0][0] && Socket.getaddrinfo(Socket.gethostname, nil, nil,
-                                                             Socket::SOCK_STREAM)[0][3] == lock[0][1]
+          # Nothing to release, and indexing an empty table would raise.
+          # Said out loud once the transaction has closed: writing a log
+          # entry can take seconds, and every other rocoto process trying
+          # to reach this database would be waiting on it.
+          next if lock.empty?
+
+          if @owner_pid == lock[0][0] && Socket.getaddrinfo(Socket.gethostname, nil, nil,
+                                                            Socket::SOCK_STREAM)[0][3] == lock[0][1]
             db.execute("DELETE FROM lock;")
+            released = true
           else
-            msg = "ERROR: Process #{Process.pid} cannot unlock the workflow because it is locked " \
+            msg = "ERROR: Process #{@owner_pid} cannot unlock the workflow because it is " \
                   "locked by pid #{lock[0][0]} on host #{lock[0][1]} since #{Time.at(lock[0][2])}."
             raise WorkflowMgr::WorkflowLockedException, msg
           end
         end
+
+        # At ordinary verbosity, not above it: this is the reason the run is
+        # about to end non-zero, and a cron user reading the mail should not
+        # be left with an unexplained failure.
+        unless released
+          msg = "WARNING: Process #{@owner_pid} found no workflow lock to release; " \
+                "it was removed by someone else."
+          WorkflowMgr.stderr(msg, 1)
+          WorkflowMgr.log(msg)
+        end
+
+        released
       rescue WorkflowMgr::WorkflowLockedException
+        # Raised rather than exited: this may be running inside an actor,
+        # where exiting kills the database out from under its caller instead
+        # of ending rocoto. The caller decides what to do about it.
         WorkflowMgr.stderr($ERROR_INFO.to_s, 3)
         WorkflowMgr.log($ERROR_INFO.to_s)
-        Process.exit(1)
+        raise
       rescue SQLite3::BusyException
         if tries < 3
           tries += 1
@@ -943,6 +1004,10 @@ module WorkflowMgr
       verify_write_access
 
       # Get a handle to the lock  database
+      # Any earlier handle is closed first: opening the database is retried
+      # when SQLite reports it busy, and each attempt would otherwise leave
+      # its connection behind.
+      @database_lock.close if @database_lock && !@database_lock.closed?
       @database_lock = SQLite3::Database.new(@database_lock_file, @mode)
 
       # Set the retry limit (milliseconds) for locked resources
@@ -975,6 +1040,9 @@ module WorkflowMgr
     ##########################################
     def open_workflow_db
       # Get a handle to the database
+      # Closed first for the same reason as the lock database: a retried
+      # open must not leave its predecessor's connection open.
+      @database.close if @database && !@database.closed?
       @database = SQLite3::Database.new(@database_file, @mode)
 
       # Set the retry limit (milliseconds) for locked resources
@@ -1094,5 +1162,51 @@ module WorkflowMgr
         db.execute("ALTER TABLE cycledef ADD COLUMN activation_offset INTEGER;")
       end
     end
+
+    ##########################################
+    #
+    # BusyRetry
+    #
+    # SQLite refuses rather than waits when another process holds the file,
+    # which happens routinely when rocotostat reads while rocotorun writes.
+    # The DRb proxy this replaced retried every call for about five seconds
+    # before giving up, so that patience is kept here instead -- in one
+    # place, and for callers that use the database directly as well as for
+    # those that reach it through an actor.
+    #
+    # Retrying is safe for these because SQLite reports the file busy only
+    # when the transaction did not begin, so nothing has been half-done.
+    #
+    # Taking and releasing the workflow lock are deliberately left out.
+    # Re-running lock_workflow after its row is committed reads that row as
+    # somebody else's lock and reports failure, so the caller abandons a
+    # workflow it holds and never unlocks it. Both methods already retry a
+    # busy database three times of their own accord, which is what they did
+    # before any of this was wrapped.
+    #
+    ##########################################
+    BUSY_TRIES = 10
+    BUSY_WAIT = 0.5
+
+    retryable = public_instance_methods(false) - %i[lock_workflow unlock_workflow]
+
+    BusyRetry = Module.new do
+      retryable.each do |operation|
+        define_method(operation) do |*args, &block|
+          tries = 0
+          begin
+            super(*args, &block)
+          rescue WorkflowMgr::WorkflowDBLockedException
+            raise if tries >= BUSY_TRIES
+
+            tries += 1
+            sleep BUSY_WAIT
+            retry
+          end
+        end
+      end
+    end
+
+    prepend BusyRetry
   end
 end

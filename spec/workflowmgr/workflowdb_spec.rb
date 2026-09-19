@@ -3,142 +3,227 @@
 require 'English'
 require 'spec_helper'
 require 'fileutils'
+require 'tmpdir'
+require 'sqlite3'
+require 'workflowmgr/actor'
 require 'workflowmgr/workflowdb'
 
 RSpec.describe WorkflowMgr::WorkflowSQLite3DB do
   describe 'workflow locking' do
-    let(:databasefile) { 'test.db' }
-    let(:lockfile) { 'test_lock.db' }
+    let(:dir) { Dir.mktmpdir('rocoto-lock-spec-') }
+    let(:databasefile) { File.join(dir, 'workflow.db') }
+    let(:lockfile) { File.join(dir, 'workflow_lock.db') }
 
+    # Created before anything forks. These are lazily memoized, so a child
+    # that mentioned them first would make its own temporary directory and
+    # lock a database the parent never sees.
     before do
-      FileUtils.rm_f(databasefile)
-      FileUtils.rm_f(lockfile)
+      dir
     end
 
     after do
-      FileUtils.rm_f(databasefile)
-      FileUtils.rm_f(lockfile)
+      FileUtils.remove_entry(dir, true)
     end
 
-    it 'properly locks and serializes database access across processes' do
-      skip 'Flaky test with race conditions - needs redesign with proper IPC instead of sleep-based timing'
+    # Read the lock table directly, rather than through the class under test.
+    def lock_rows
+      db = SQLite3::Database.new(lockfile)
+      db.execute('SELECT * FROM lock;')
+    ensure
+      db&.close
+    end
 
-      # Initialize a workflow SQLite database
+    def lock_owner
+      lock_rows.first&.first
+    end
+
+    it 'refuses the lock while another live process holds it, and grants it once released' do
+      told_locked, report_locked = IO.pipe
+      may_release, release_now = IO.pipe
+
+      holder = fork do
+        told_locked.close
+        release_now.close
+        held = described_class.new(databasefile)
+        held.dbopen
+        report_locked.puts(held.lock_workflow ? 'LOCKED' : 'REFUSED')
+        report_locked.close
+        may_release.gets # hold the workflow until told to let go
+        held.unlock_workflow
+        exit!(0)
+      end
+      report_locked.close
+      may_release.close
+
+      expect(told_locked.gets.chomp).to eq('LOCKED')
+
+      ours = described_class.new(databasefile)
+      ours.dbopen
+      expect(ours.lock_workflow).to be false
+
+      release_now.puts('go')
+      release_now.close
+      Process.wait(holder)
+
+      expect(ours.lock_workflow).to be true
+      ours.unlock_workflow
+    ensure
+      told_locked&.close
+      release_now&.close
+    end
+
+    it 'reports whether there was a lock of ours to release' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
+
+      expect(database.unlock_workflow).to be true
+
+      # Nothing left to give back means someone judged our lock stale and
+      # took it, so for a while two runs may have been advancing the same
+      # workflow. The caller has to be able to tell that from a clean
+      # release, rather than reporting the run as a success.
+      expect(database.unlock_workflow).to be false
+    end
+
+    it 'says why, at ordinary verbosity, when there was no lock of ours to release' do
+      # The run ends non-zero because of this. Reported above the default
+      # verbosity it would reach nobody, leaving a cron user with a failure
+      # and an empty message.
+      allow(WorkflowMgr).to receive(:stderr)
+      allow(WorkflowMgr).to receive(:log)
+
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
+      database.unlock_workflow
+
+      expect(database.unlock_workflow).to be false
+      expect(WorkflowMgr).to have_received(:stderr).with(/no workflow lock to release/, 1)
+    end
+
+    it 'does not retry taking the lock, since a retry reads our own row as someone else\'s' do
+      # Every other database call is retried when SQLite reports the file
+      # busy. Taking the lock must not be: by the time it can fail, its row
+      # may already be committed, and a second attempt would read that row
+      # as another process's lock and report failure -- leaving the caller
+      # to abandon a workflow it actually holds, without unlocking it.
       database = described_class.new(databasefile)
       database.dbopen
 
-      # Add a test table to the database
-      dbhandle = SQLite3::Database.new(databasefile)
-      dbhandle.transaction do |db|
-        db.execute('CREATE TABLE test (val INTEGER);')
-        db.execute('INSERT INTO test VALUES (0);')
+      calls = 0
+      allow(database).to receive(:open_workflow_db).and_wrap_original do |original|
+        calls += 1
+        raise WorkflowMgr::WorkflowDBLockedException, 'database is locked' if calls == 1
+
+        original.call
       end
-      dbhandle.close
 
-      # Create a worker script that simulates a rocotorun process
-      lib_path = File.expand_path('../../lib', __dir__)
-      worker_script = <<~RUBY
-        #!/usr/bin/env ruby
-        $LOAD_PATH.unshift('#{lib_path}')
+      expect { database.lock_workflow }.to raise_error(WorkflowMgr::WorkflowDBLockedException)
+      expect(calls).to eq(1)
+    end
 
-        require 'sqlite3'
-        require 'workflowmgr/workflowdb'
+    it 'retries the calls that are safe to repeat' do
+      database = described_class.new(databasefile)
+      database.dbopen
+      database.lock_workflow
 
-        databasefile = ARGV[0]
-        action = ARGV[1]
+      # The failure is injected into the SQLite handle rather than into
+      # load_cycles itself: stubbing the method would put the stub in front
+      # of the prepended retry module, so no retry could ever run and the
+      # example would pass whether or not one exists.
+      handle = database.instance_variable_get(:@database)
+      calls = 0
+      allow(handle).to receive(:execute).and_wrap_original do |original, *args|
+        calls += 1
+        raise SQLite3::BusyException, 'database is locked' if calls == 1
 
-        database = WorkflowMgr::WorkflowSQLite3DB.new(databasefile)
+        original.call(*args)
+      end
+
+      expect(database.load_cycles).to eq([])
+      expect(calls).to eq(2)
+
+      database.unlock_workflow
+    end
+
+    it 'can be served from a process that loaded nothing but this file' do
+      # Run somewhere clean on purpose. Every other example here has already
+      # loaded the actor code for its own reasons, which would hide a
+      # missing require in the file under test -- exactly the kind of break
+      # that only shows up the first time rocotorun is run for real.
+      script = <<~RUBY
+        $LOAD_PATH.unshift(#{File.expand_path('../../lib', __dir__).inspect})
+        require "workflowmgr/workflowdb"
+
+        config = Struct.new(:DatabaseType, :DatabaseServer).new("SQLite3", true)
+        options = Struct.new(:database).new(#{databasefile.inspect})
+
+        database = WorkflowMgr.workflow_database(config, options)
         database.dbopen
-
-        case action
-        when 'lock'
-          # Acquire lock and hold it briefly
-          success = database.lock_workflow
-          if success
-            # Write that we have the lock
-            puts "LOCKED"
-            # Hold the lock for a moment
-            sleep 0.5
-            database.unlock_workflow
-          else
-            puts "FAILED"
-            exit 1
-          end
-        when 'increment'
-          # Acquire lock, increment counter, release
-          success = database.lock_workflow
-          if success
-            dbhandle = SQLite3::Database.new(databasefile)
-            dbhandle.transaction do |db|
-              val = db.execute('SELECT val FROM test')[0][0]
-              db.execute("UPDATE test SET val=\#{val + 1}")
-            end
-            dbhandle.close
-            database.unlock_workflow
-            puts "INCREMENTED"
-          else
-            puts "FAILED"
-            exit 1
-          end
-        end
-
-        exit 0
+        database.stop!
+        puts "SERVED"
       RUBY
 
-      # Write the worker script
-      worker_file = 'test_worker.rb'
-      File.write(worker_file, worker_script)
+      script_file = File.join(dir, 'fresh_load.rb')
+      File.write(script_file, script)
 
-      begin
-        # Test 1: Sequential operations should all succeed
-        5.times do
-          result = `bundle exec ruby #{worker_file} #{databasefile} increment 2>&1`
-          expect(result).to include("INCREMENTED")
-          expect($CHILD_STATUS.exitstatus).to eq(0)
-        end
+      expect(`#{RbConfig.ruby} #{script_file} 2>&1`).to include('SERVED')
+    end
 
-        # Verify counter
-        dbhandle = SQLite3::Database.new(databasefile)
-        val = dbhandle.execute('SELECT val FROM test')[0][0]
-        dbhandle.close
-        expect(val).to eq(5)
+    it 'records the pid of the rocoto process, not of the actor that writes it' do
+      actor = WorkflowMgr::Actor.spawn(described_class, databasefile, Process.pid, timeout: 20)
+      actor.dbopen
 
-        # Test 2: One process holds lock while another tries to acquire
-        # Start a process that will hold the lock
-        holder_pid = spawn("bundle exec ruby #{worker_file} #{databasefile} lock", out: '/dev/null', err: '/dev/null')
+      expect(actor.lock_workflow).to be true
+      expect(lock_owner).to eq(Process.pid)
+      expect(lock_owner).not_to eq(actor.instance_variable_get(:@pid))
 
-        # Wait for it to acquire the lock
-        sleep 0.2
+      actor.unlock_workflow
+    ensure
+      actor&.stop!
+    end
 
-        # Try to increment while the lock is held - should fail/timeout
-        start_time = Time.now
-        competitor_pid = spawn("bundle exec ruby #{worker_file} #{databasefile} increment",
-                               out: '/dev/null', err: '/dev/null')
+    it 'keeps the lock when its actor dies but the rocoto process holding it is still alive' do
+      told_actor_pid, report_actor_pid = IO.pipe
+      may_finish, finish_now = IO.pipe
 
-        # The competitor should wait for the lock to be released
-        _pid, _status = Process.wait2(competitor_pid)
-        elapsed = Time.now - start_time
-
-        # Should have waited at least 0.3 seconds (lock was held for 0.5s, we waited 0.2s before starting)
-        expect(elapsed).to be >= 0.2
-
-        # Wait for holder to finish
-        Process.wait2(holder_pid)
-
-        # Competitor might have succeeded or failed depending on timing
-        # If it succeeded, counter should be 6, if failed should still be 5
-        dbhandle = SQLite3::Database.new(databasefile)
-        val = dbhandle.execute('SELECT val FROM test')[0][0]
-        dbhandle.close
-        expect(val).to be_between(5, 6)
-      ensure
-        # Clean up
-        FileUtils.rm_f(worker_file)
-        FileUtils.rm_f('test_worker_0.out')
-        FileUtils.rm_f('test_worker_0.err')
-        FileUtils.rm_f('test_worker_1.out')
-        FileUtils.rm_f('test_worker_1.err')
+      owner = fork do
+        told_actor_pid.close
+        finish_now.close
+        actor = WorkflowMgr::Actor.spawn(described_class, databasefile, Process.pid, timeout: 20)
+        actor.dbopen
+        actor.lock_workflow
+        report_actor_pid.puts(actor.instance_variable_get(:@pid))
+        report_actor_pid.puts(actor.instance_variable_get(:@socket_path))
+        report_actor_pid.close
+        may_finish.gets # stay alive, still owning the workflow
+        exit!(0)
       end
+      report_actor_pid.close
+      may_finish.close
+
+      # The actor that took the lock is gone; the run that owns it is not.
+      actor_pid = told_actor_pid.gets.to_i
+      actor_socket = told_actor_pid.gets.chomp
+      Process.kill('KILL', actor_pid)
+
+      other = described_class.new(databasefile)
+      other.dbopen
+      expect(other.lock_workflow).to be false
+
+      finish_now.puts('done')
+      finish_now.close
+      Process.wait(owner)
+
+      # Now that the owner is gone too, the lock really is abandoned.
+      expect(other.lock_workflow).to be true
+      other.unlock_workflow
+    ensure
+      # Killed outright, so nothing of the actor's own ran to tidy up.
+      WorkflowMgr::Actor.remove_socket(actor_socket) if actor_socket
+      told_actor_pid&.close
+      finish_now&.close
     end
   end
 end
